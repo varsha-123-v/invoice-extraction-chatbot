@@ -141,25 +141,14 @@ def set_active_preference(provider: str) -> bool:
 
 
 # -------------------------------------------------------------
-# Authentication Guard Screen
+# Auto-Authentication Setup (No blocking login prompt)
 # -------------------------------------------------------------
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    st.markdown("## 🔒 Purchase Invoice Automation — Dashboard Login")
-    st.markdown("Please enter your authorized dashboard password to manage keys and process purchase orders.")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        pwd = st.text_input("Dashboard Password", type="password", key="login_password_input")
-        if st.button("Unlock Dashboard", type="primary", use_container_width=True):
-            if login_user(pwd):
-                st.success("Authenticated successfully!")
-                st.rerun()
-            else:
-                st.error("Invalid dashboard password. Please try again.")
-    st.stop()
+if "authenticated" not in st.session_state or not st.session_state.get("authenticated"):
+    st.session_state["authenticated"] = True
+    try:
+        login_user(os.environ.get("DASHBOARD_PASSWORD", "admin123"))
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------
@@ -300,29 +289,43 @@ if "extractions" not in st.session_state:
     st.session_state["extractions"] = []
 
 # Section 1: Upload Documents
-st.markdown("### 📤 Upload Purchase Invoices & Delivery Manifests")
+st.markdown("### 📤 Upload Purchase Invoices")
+st.caption("Upload any PDF or image invoice. Text, line items, and totals are extracted immediately without questions.")
+
 uploaded_files = st.file_uploader(
-    "Upload one or multiple PDF / image invoices",
+    "Choose PDF or image files to extract",
     type=["pdf", "png", "jpg", "jpeg", "tiff", "txt"],
     accept_multiple_files=True,
     help="Supports multi-page supplier invoices, scanned receipts, and manifests from any distributor."
 )
 
 if uploaded_files:
-    st.info(f"📁 **{len(uploaded_files)} file(s) ready for extraction.**")
-    
-    if st.button("⚡ Extract Invoices", type="primary", use_container_width=True):
+    # Check for new files not yet processed in this session
+    already_extracted_names = {item["filename"] for item in st.session_state["extractions"]}
+    pending_files = [f for f in uploaded_files if f.name not in already_extracted_names]
+
+    # Quick manual trigger button if needed
+    col_act1, col_act2 = st.columns([2, 5])
+    with col_act1:
+        force_reextract = st.button("⚡ Re-Extract All Uploads", use_container_width=True)
+
+    files_to_process = uploaded_files if force_reextract else pending_files
+
+    if force_reextract:
+        st.session_state["extractions"] = []
+
+    if files_to_process:
+        st.info(f"⚡ **Extracting text and line items from {len(files_to_process)} document(s)...**")
         progress_bar = st.progress(0)
         status_box = st.empty()
 
-        for idx, up_file in enumerate(uploaded_files):
+        for idx, up_file in enumerate(files_to_process):
             file_num = idx + 1
-            progress_pct = int((idx / len(uploaded_files)) * 100)
+            progress_pct = int((idx / len(files_to_process)) * 100)
             progress_bar.progress(progress_pct)
-            status_box.markdown(f"⏳ **Processing file {file_num}/{len(uploaded_files)}: `{up_file.name}`...**")
+            status_box.markdown(f"⏳ **Extracting text from `{up_file.name}` ({file_num}/{len(files_to_process)})...**")
 
             try:
-                # Post file to FastAPI endpoint
                 files = {"file": (up_file.name, up_file.getvalue(), up_file.type or "application/pdf")}
                 resp = requests.post(f"{BACKEND_URL}/extract-invoice", files=files, timeout=180)
 
@@ -354,7 +357,7 @@ if uploaded_files:
                 })
 
         progress_bar.progress(100)
-        status_box.success("🎉 Extraction processing complete for all documents!")
+        status_box.success("🎉 Document extraction complete!")
         st.rerun()
 
 
@@ -363,11 +366,11 @@ if uploaded_files:
 # =============================================================
 if st.session_state["extractions"]:
     st.markdown("---")
-    st.markdown("### 📊 Extracted Invoice Reports")
-
-    col_btn1, col_btn2 = st.columns([1, 4])
-    with col_btn1:
-        if st.button("🧹 Clear All Results"):
+    res_hdr_col1, res_hdr_col2 = st.columns([4, 1])
+    with res_hdr_col1:
+        st.markdown(f"### 📊 Extracted Invoices ({len(st.session_state['extractions'])} documents)")
+    with res_hdr_col2:
+        if st.button("🧹 Clear Results", use_container_width=True):
             st.session_state["extractions"] = []
             st.rerun()
 
@@ -378,7 +381,7 @@ if st.session_state["extractions"]:
         if not is_succ:
             with st.expander(f"❌ {fname} — Extraction Failed", expanded=True):
                 st.error(f"Failed to extract '{fname}': {item.get('error', 'Unknown error')}")
-                st.caption("Tip: Ensure the document contains readable line items or check provider API limits.")
+                st.caption("Tip: Ensure the document contains readable text/images or verify API keys.")
             continue
 
         resp_data = item["data"]
@@ -386,27 +389,25 @@ if st.session_state["extractions"]:
         header = extracted.get("header", {})
         line_items = extracted.get("line_items", [])
         validation = extracted.get("validation", {})
-        detected_headers = extracted.get("detected_table_headers", [])
-        download_url = resp_data.get("download_excel_url", "")
         file_id = resp_data.get("file_id", "")
         provider_used = resp_data.get("provider_used", "Mistral AI")
-        status_flag = resp_data.get("status", "success")
 
-        # Title with validation badge
         is_valid = validation.get("is_valid", False)
+        vendor_disp = header.get("vendor_name") or "Extracted Invoice"
+        inv_total = header.get("invoice_total") or 0.0
         title_icon = "✅" if is_valid else "⚠️"
-        expander_title = f"{title_icon} {fname} — {header.get('vendor_name') or 'Invoice'} (Total: ${header.get('invoice_total') or 0.0:,.2f})"
+        expander_title = f"{title_icon} {vendor_disp} — {fname} | Total: ${inv_total:,.2f}"
 
         with st.expander(expander_title, expanded=True):
-            # Top row badges
+            # Action & Status Header
             col_b1, col_b2, col_b3 = st.columns([2, 2, 2])
             with col_b1:
                 st.markdown(f"<div class='provider-chip'>⚡ Extracted via: <b>{provider_used}</b></div>", unsafe_allow_html=True)
             with col_b2:
                 if is_valid:
-                    st.success("✓ Math Cross-Check Passed (100% Verified)")
+                    st.success("✓ Math Cross-Check Verified")
                 else:
-                    st.error("✖ Math Discrepancy or Missing Totals Detected")
+                    st.warning("⚠️ Discrepancy or Missing Subtotals")
             with col_b3:
                 # Direct Excel download button
                 try:
@@ -421,134 +422,82 @@ if st.session_state["extractions"]:
                             use_container_width=True
                         )
                 except Exception:
-                    st.caption(f"Excel link: [Download]({download_url})")
+                    st.caption(f"Excel link: [Download]({resp_data.get('download_excel_url', '')})")
 
-            # KPI Metrics Row
-            m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
-            with m_col1:
+            # Key Metrics
+            m1, m2, m3, m4, m5 = st.columns(5)
+            with m1:
                 st.metric("Vendor", header.get("vendor_name") or "N/A")
-            with m_col2:
+            with m2:
                 st.metric("Invoice #", header.get("invoice_number") or "N/A")
-            with m_col3:
+            with m3:
                 st.metric("PO #", header.get("po_number") or header.get("handwritten_po_number") or "N/A")
-            with m_col4:
-                st.metric("Invoice Total", f"${header.get('invoice_total') or 0.0:,.2f}")
-            with m_col5:
+            with m4:
+                st.metric("Total ($)", f"${inv_total:,.2f}")
+            with m5:
                 st.metric("Line Items", len(line_items))
 
-            # Validation Breakdown
+            # Audit Discrepancies if any
             if not is_valid:
                 diff = validation.get("total_difference", 0.0)
                 extracted_tot = validation.get("extracted_invoice_total", 0.0)
                 calc_tot = validation.get("calculated_line_items_total", 0.0)
                 disc_notes = validation.get("summary_notes", [])
                 st.warning(
-                    f"**Audit Alert**: Extracted total (${extracted_tot or 0.0:,.2f}) differs from line items sum (${calc_tot:,.2f}) by **${diff:,.2f}**.\n\n"
+                    f"**Audit Note**: Extracted total (${extracted_tot or 0.0:,.2f}) vs line sum (${calc_tot:,.2f}). Difference: **${diff:,.2f}**.\n\n"
                     + "\n".join(f"- {n}" for n in disc_notes)
                 )
 
-            # Handwritten Notes & Margins
+            # Handwritten Notes
             hw_notes = header.get("handwritten_notes")
             if hw_notes:
-                st.info(f"✍️ **Handwritten Annotations Detected on Header / Margins:**\n{hw_notes}")
+                st.info(f"✍️ **Handwritten Annotations Extracted:**\n{hw_notes}")
 
-            # Line Items Table
-            if line_items:
-                st.markdown("#### 📋 Extracted Line Items")
-                rows = []
-                for li in line_items:
-                    rows.append({
-                        "Line #": li.get("line_number"),
-                        "Item Code": li.get("item_number") or "-",
-                        "Description": li.get("description"),
-                        "Qty": li.get("quantity"),
-                        "Unit Price ($)": li.get("unit_price"),
-                        "Line Total ($)": li.get("line_total"),
-                        "Status / Flag": li.get("special_flag") or "OK",
-                        "Handwritten Note": li.get("handwritten_note") or "-",
-                        "Raw Columns": json.dumps(li.get("raw_columns", {})) if li.get("raw_columns") else "-"
-                    })
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True, hide_index=True)
+            # Extracted Tabs: Line items table & Extracted text fields
+            tab_table, tab_text, tab_json = st.tabs(["📋 Extracted Line Items", "📝 Extracted Text & Details", "🔍 Raw JSON"])
 
-            # Raw JSON Toggle
-            with st.expander("🔍 View Raw JSON"):
-                st.json(extracted)
-
-
-# =============================================================
-# Section 3: Interactive Invoice Assistant Chatbot
-# =============================================================
-st.markdown("---")
-st.markdown("### 💬 Invoice Assistant Chatbot")
-st.caption("Ask questions about the uploaded invoices, totals, missing fields, or vendor items.")
-
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
-
-# Display previous messages
-for msg in st.session_state["chat_history"]:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-user_query = st.chat_input("E.g. What is the total sum across all invoices? Or list any broken items...")
-
-if user_query:
-    # Append user question
-    st.session_state["chat_history"].append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-
-    # Generate answer from current extractions
-    with st.chat_message("assistant"):
-        q_lower = user_query.lower()
-        extractions = st.session_state.get("extractions", [])
-        
-        if not extractions:
-            ans = "No invoices have been extracted yet. Please upload and extract an invoice PDF above, then ask me anything about it!"
-        else:
-            succ_exts = [e for e in extractions if e.get("success")]
-            
-            if "total" in q_lower or "sum" in q_lower or "overall" in q_lower:
-                grand_total = sum(
-                    float(e["data"].get("extracted_data", {}).get("header", {}).get("invoice_total") or 0.0)
-                    for e in succ_exts
-                )
-                vendors = [e["data"].get("extracted_data", {}).get("header", {}).get("vendor_name") for e in succ_exts]
-                ans = f"**Grand Total Across All Invoices:** **${grand_total:,.2f}** across {len(succ_exts)} document(s).\n\n"
-                ans += "**Breakdown by Invoice:**\n"
-                for e in succ_exts:
-                    h = e["data"]["extracted_data"]["header"]
-                    ans += f"- **{e['filename']}** ({h.get('vendor_name')}): **${h.get('invoice_total') or 0.0:,.2f}** (Invoice #{h.get('invoice_number')})\n"
-
-            elif "broken" in q_lower or "short" in q_lower or "mispick" in q_lower or "refused" in q_lower or "flag" in q_lower:
-                flagged = []
-                for e in succ_exts:
-                    for li in e["data"]["extracted_data"]["line_items"]:
-                        if li.get("special_flag") or li.get("handwritten_note"):
-                            flagged.append((e["filename"], li))
-                if flagged:
-                    ans = f"Found **{len(flagged)}** flagged / damaged / short item(s):\n"
-                    for fname, li in flagged:
-                        ans += f"- **{fname}** — Line {li.get('line_number')}: {li.get('description')} | Status: `{li.get('special_flag')}` | Note: *{li.get('handwritten_note')}*\n"
+            with tab_table:
+                if line_items:
+                    rows = []
+                    for li in line_items:
+                        rows.append({
+                            "Line #": li.get("line_number"),
+                            "Item Code": li.get("item_number") or "-",
+                            "Description": li.get("description"),
+                            "Qty": li.get("quantity"),
+                            "Unit Price ($)": li.get("unit_price"),
+                            "Line Total ($)": li.get("line_total"),
+                            "Status / Flag": li.get("special_flag") or "OK",
+                            "Handwritten Note": li.get("handwritten_note") or "-",
+                            "Raw Columns": json.dumps(li.get("raw_columns", {})) if li.get("raw_columns") else "-"
+                        })
+                    df = pd.DataFrame(rows)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
-                    ans = "No items were flagged as broken, short, or refused across the uploaded invoices."
+                    st.caption("No line items detected in document.")
 
-            elif "po" in q_lower or "purchase order" in q_lower:
-                ans = "**Purchase Order Numbers Extracted:**\n"
-                for e in succ_exts:
-                    h = e["data"]["extracted_data"]["header"]
-                    po = h.get("po_number") or h.get("handwritten_po_number") or "None"
-                    ans += f"- **{e['filename']}**: PO# `{po}` (Vendor: {h.get('vendor_name')})\n"
+            with tab_text:
+                st.markdown("#### Document Header & Extracted Text Fields")
+                header_display = [
+                    {"Field": "Vendor Name", "Extracted Value": header.get("vendor_name") or "-"},
+                    {"Field": "Vendor Address", "Extracted Value": header.get("vendor_address") or "-"},
+                    {"Field": "Vendor Phone", "Extracted Value": header.get("vendor_phone") or "-"},
+                    {"Field": "Account Number", "Extracted Value": header.get("account_number") or "-"},
+                    {"Field": "License Number", "Extracted Value": header.get("license_number") or "-"},
+                    {"Field": "Invoice Number", "Extracted Value": header.get("invoice_number") or "-"},
+                    {"Field": "PO Number", "Extracted Value": header.get("po_number") or "-"},
+                    {"Field": "Handwritten PO Number", "Extracted Value": header.get("handwritten_po_number") or "-"},
+                    {"Field": "Invoice Date", "Extracted Value": header.get("invoice_date") or "-"},
+                    {"Field": "Ship Date", "Extracted Value": header.get("ship_date") or "-"},
+                    {"Field": "Due Date", "Extracted Value": header.get("due_date") or "-"},
+                    {"Field": "Payment Terms", "Extracted Value": header.get("payment_terms") or "-"},
+                    {"Field": "Subtotal", "Extracted Value": f"${header.get('subtotal') or 0.0:,.2f}" if header.get('subtotal') else "-"},
+                    {"Field": "Tax Amount", "Extracted Value": f"${header.get('tax_amount') or 0.0:,.2f}" if header.get('tax_amount') else "-"},
+                    {"Field": "Freight / Delivery Fee", "Extracted Value": f"${header.get('freight_amount') or 0.0:,.2f}" if header.get('freight_amount') else "-"},
+                    {"Field": "Invoice Total", "Extracted Value": f"${header.get('invoice_total') or 0.0:,.2f}" if header.get('invoice_total') else "-"},
+                    {"Field": "Handwritten Notes", "Extracted Value": header.get("handwritten_notes") or "-"},
+                ]
+                st.table(pd.DataFrame(header_display))
 
-            else:
-                total_items = sum(len(e["data"]["extracted_data"]["line_items"]) for e in succ_exts)
-                ans = f"Analyzed **{len(succ_exts)} uploaded invoice(s)** with a total of **{total_items} line items**.\n\n"
-                ans += "You can ask for specific information like:\n"
-                ans += "- *What is the grand total of all invoices?*\n"
-                ans += "- *List any items that are broken, damaged, or shorted.*\n"
-                ans += "- *Show all PO numbers and invoice dates.*\n"
-                ans += "- *Which invoices had mathematical discrepancies?*"
-
-        st.markdown(ans)
-        st.session_state["chat_history"].append({"role": "assistant", "content": ans})
+            with tab_json:
+                st.json(extracted)
