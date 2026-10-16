@@ -10,3 +10,4 @@ requests>=2.31.0
 json-repair>=0.25.0
 pypdfium2>=4.30.0
 pypdf>=4.0.0
+pandas>=2.0.0
