@@ -803,19 +803,144 @@ def process_invoice_extraction(file_path: Path) -> ExtractionTuple:
     configured_providers = [p for p in key_manager.get_fallback_order() if key_manager.get_key(p)]
     if configured_providers and (b64_images or doc_text.strip()):
         try:
-            logger.info(f"Executing adaptive multi-provider document extraction (Providers: {configured_providers})...")
-            res, p_used = execute_ai_vision_call(
-                ADAPTIVE_EXTRACTION_PROMPT,
-                file_path,
-                doc_text,
-                b64_images,
-                retry_prompt=FOCUSED_RETRY_PROMPT,
-                max_tokens=8192
-            )
-            extracted_dict = res.get("printed_extraction", res) if isinstance(res, dict) else {}
-            header, line_items, detected_headers = parse_extraction_dict(extracted_dict)
-            if line_items:
-                provider_used = p_used
+            if len(b64_images) > 1:
+                logger.info(f"Multi-page document detected ({len(b64_images)} pages). Running page-by-page extraction for full completeness...")
+                all_headers: List[InvoiceHeader] = []
+                all_line_items: List[LineItem] = []
+                all_detected_headers: List[str] = []
+                last_provider_used = provider_used
+
+                for page_idx, b64_img in enumerate(b64_images, start=1):
+                    logger.info(f"Extracting Page {page_idx} of {len(b64_images)} for '{file_path.name}'...")
+                    page_prompt = (
+                        f"{ADAPTIVE_EXTRACTION_PROMPT}\n\n"
+                        f"CRITICAL MULTI-PAGE INSTRUCTION:\n"
+                        f"You are extracting Page {page_idx} of {len(b64_images)} of document '{file_path.name}'.\n"
+                        f"Extract every single line item row visible on this page into 'line_items'. Do NOT skip or omit any items.\n"
+                        f"Capture the invoice number, date, vendor, total, and handwritten notes visible on this page."
+                    )
+                    try:
+                        res, p_used = execute_ai_vision_call(
+                            page_prompt,
+                            file_path,
+                            "",  # keep page vision call token-efficient
+                            [b64_img],
+                            retry_prompt=FOCUSED_RETRY_PROMPT,
+                            max_tokens=8192
+                        )
+                        last_provider_used = p_used
+                        extracted_dict = res.get("printed_extraction", res) if isinstance(res, dict) else {}
+                        p_header, p_items, p_cols = parse_extraction_dict(extracted_dict)
+                        if p_header:
+                            all_headers.append(p_header)
+                        for item in p_items:
+                            if p_header and p_header.invoice_number:
+                                item.raw_columns.setdefault("Invoice#", p_header.invoice_number)
+                            item.raw_columns.setdefault("Page", f"Page {page_idx}")
+                            all_line_items.append(item)
+                        for col in p_cols:
+                            if col not in all_detected_headers:
+                                all_detected_headers.append(col)
+                        logger.info(f"Page {page_idx}/{len(b64_images)} extracted successfully: {len(p_items)} line items found.")
+                    except Exception as page_err:
+                        logger.warning(f"Failed to extract Page {page_idx} via AI: {page_err}. Continuing with remaining pages...")
+
+                if all_line_items:
+                    # Renumber line items consecutively
+                    for idx, item in enumerate(all_line_items, start=1):
+                        item.line_number = idx
+
+                    line_items = all_line_items
+                    detected_headers = all_detected_headers
+                    provider_used = last_provider_used
+
+                    # Merge headers from all pages
+                    merged_header = InvoiceHeader()
+                    inv_numbers: List[str] = []
+                    hw_notes_list: List[str] = []
+                    totals_by_inv: Dict[str, float] = {}
+                    current_inv = None
+
+                    for p_i, h in enumerate(all_headers, start=1):
+                        if h.vendor_name and not merged_header.vendor_name:
+                            merged_header.vendor_name = h.vendor_name
+                        if h.vendor_address and not merged_header.vendor_address:
+                            merged_header.vendor_address = h.vendor_address
+                        if h.vendor_phone and not merged_header.vendor_phone:
+                            merged_header.vendor_phone = h.vendor_phone
+                        if h.store_customer and not merged_header.store_customer:
+                            merged_header.store_customer = h.store_customer
+                        if h.store_address and not merged_header.store_address:
+                            merged_header.store_address = h.store_address
+                        if h.invoice_date and not merged_header.invoice_date:
+                            merged_header.invoice_date = h.invoice_date
+                        if h.po_number and not merged_header.po_number:
+                            merged_header.po_number = h.po_number
+                        if h.handwritten_po_number and not merged_header.handwritten_po_number:
+                            merged_header.handwritten_po_number = h.handwritten_po_number
+                        if h.terms and not merged_header.terms:
+                            merged_header.terms = h.terms
+                        if h.due_date and not merged_header.due_date:
+                            merged_header.due_date = h.due_date
+                        if h.driver_info and not merged_header.driver_info:
+                            merged_header.driver_info = h.driver_info
+
+                        if h.invoice_number and h.invoice_number not in inv_numbers:
+                            inv_numbers.append(h.invoice_number)
+                            current_inv = h.invoice_number
+
+                        if h.handwritten_notes and h.handwritten_notes not in hw_notes_list:
+                            hw_notes_list.append(h.handwritten_notes)
+
+                        # Track invoice totals across pages
+                        if h.invoice_total is not None and h.invoice_total > 0:
+                            inv_key = current_inv or f"page_{p_i}"
+                            totals_by_inv[inv_key] = max(totals_by_inv.get(inv_key, 0.0), h.invoice_total)
+
+                        # Merge raw_header_fields
+                        if h.raw_header_fields:
+                            merged_header.raw_header_fields.update(h.raw_header_fields)
+
+                    merged_header.invoice_number = ", ".join(inv_numbers) if inv_numbers else None
+                    merged_header.handwritten_notes = "; ".join(hw_notes_list) if hw_notes_list else None
+
+                    # Sum totals across distinct invoices
+                    if totals_by_inv:
+                        merged_header.invoice_total = round(sum(totals_by_inv.values()), 2)
+                    elif any(h.invoice_total == 0.0 for h in all_headers):
+                        merged_header.invoice_total = 0.0
+                    else:
+                        merged_header.invoice_total = None
+
+                    # Sum financial subtotals
+                    subtotals = [h.subtotal for h in all_headers if h.subtotal is not None and h.subtotal > 0]
+                    if subtotals:
+                        merged_header.subtotal = round(sum(subtotals), 2)
+                    taxes = [h.tax for h in all_headers if h.tax is not None and h.tax > 0]
+                    if taxes:
+                        merged_header.tax = round(sum(taxes), 2)
+                    deposits = [h.deposits for h in all_headers if h.deposits is not None and h.deposits > 0]
+                    if deposits:
+                        merged_header.deposits = round(sum(deposits), 2)
+                    discounts = [h.discounts for h in all_headers if h.discounts is not None and h.discounts > 0]
+                    if discounts:
+                        merged_header.discounts = round(sum(discounts), 2)
+
+                    header = merged_header
+            else:
+                logger.info(f"Executing adaptive multi-provider document extraction (Providers: {configured_providers})...")
+                res, p_used = execute_ai_vision_call(
+                    ADAPTIVE_EXTRACTION_PROMPT,
+                    file_path,
+                    doc_text,
+                    b64_images,
+                    retry_prompt=FOCUSED_RETRY_PROMPT,
+                    max_tokens=8192
+                )
+                extracted_dict = res.get("printed_extraction", res) if isinstance(res, dict) else {}
+                header, line_items, detected_headers = parse_extraction_dict(extracted_dict)
+                if line_items:
+                    provider_used = p_used
         except Exception as e:
             ai_error = str(e)
             logger.warning(f"AI extraction error: {e}. Executing deterministic fallback parser...")
