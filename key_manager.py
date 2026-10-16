@@ -88,12 +88,25 @@ def _mask_key(key: str) -> str:
 
 
 def load_keys() -> Dict[str, str]:
-    """Loads API keys from backend encrypted store, seeding from config/.env if not present."""
+    """Loads API keys from backend encrypted store, seeding from config/.env or Streamlit secrets if not present."""
     global _active_provider_preference
+    m_key = os.getenv("MISTRAL_API_KEY") or MISTRAL_API_KEY or ""
+    g_key = os.getenv("GROQ_API_KEY") or GROQ_API_KEY or ""
+    o_key = os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY or ""
+
+    try:
+        import streamlit as _st
+        if hasattr(_st, "secrets"):
+            m_key = m_key or str(_st.secrets.get("MISTRAL_API_KEY", ""))
+            g_key = g_key or str(_st.secrets.get("GROQ_API_KEY", ""))
+            o_key = o_key or str(_st.secrets.get("OPENROUTER_API_KEY", ""))
+    except Exception:
+        pass
+
     keys: Dict[str, str] = {
-        "mistral": MISTRAL_API_KEY or "",
-        "groq": GROQ_API_KEY or "",
-        "openrouter": OPENROUTER_API_KEY or ""
+        "mistral": m_key.strip(),
+        "groq": g_key.strip(),
+        "openrouter": o_key.strip()
     }
 
     if KEYS_ENC_PATH.exists():

@@ -238,10 +238,19 @@ def set_active_preference(provider: str) -> bool:
 
 def extract_single_document(up_file) -> Dict[str, Any]:
     health = check_backend_health()
+    file_bytes = up_file.getvalue() if hasattr(up_file, "getvalue") else up_file.read()
+
+    if not file_bytes or len(file_bytes) == 0:
+        return {
+            "filename": up_file.name,
+            "success": False,
+            "error": "The uploaded file is empty (0 bytes). Please upload a valid document."
+        }
+
     # 1. Try remote FastAPI backend if online
     if health.get("mode") in ["remote", "local_api"]:
         try:
-            files = {"file": (up_file.name, up_file.getvalue(), up_file.type or "application/pdf")}
+            files = {"file": (up_file.name, file_bytes, up_file.type or "application/pdf")}
             resp = requests.post(f"{BACKEND_URL}/extract-invoice", files=files, timeout=180)
             if resp.status_code == 200:
                 return {
@@ -265,12 +274,23 @@ def extract_single_document(up_file) -> Dict[str, Any]:
 
     # 2. Use embedded standalone engine
     if LOCAL_ENGINE_AVAILABLE:
-        suffix = Path(up_file.name).suffix or ".pdf"
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        # Check if an API key is configured
+        if key_manager:
+            active_keys = [p for p in key_manager.get_fallback_order() if key_manager.get_key(p)]
+            if not active_keys:
+                return {
+                    "filename": up_file.name,
+                    "success": False,
+                    "error": "⚠️ No AI API Key is configured yet. Please paste your Mistral API key in the left sidebar under 'Update / Add Key' (or add MISTRAL_API_KEY in Streamlit Secrets) to extract documents."
+                }
+
+        temp_dir = Path(tempfile.gettempdir()) / "invoice_uploads"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        clean_name = "".join(c for c in up_file.name if c.isalnum() or c in "._- ")
+        tmp_path = temp_dir / f"{uuid.uuid4().hex[:6]}_{clean_name}"
+
         try:
-            tmp_file.write(up_file.getvalue())
-            tmp_file.close()
-            tmp_path = Path(tmp_file.name)
+            tmp_path.write_bytes(file_bytes)
 
             # Process extraction pipeline
             extraction_res = process_invoice_extraction(tmp_path)
@@ -327,7 +347,7 @@ def extract_single_document(up_file) -> Dict[str, Any]:
             }
         finally:
             try:
-                Path(tmp_file.name).unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -475,6 +495,11 @@ with header_col2:
         st.success(f"🟢 Engine Online ({mode_label})\nActive: {health_info.get('active_provider', 'Mistral').capitalize()}")
     else:
         st.error(f"🔴 Engine Offline\n{health_info.get('error', 'Cannot reach backend')}")
+
+# Check if any provider key is configured
+has_configured_key = any(p.get("has_key") for p in providers_info.values())
+if not has_configured_key:
+    st.warning("🔑 **Action Required:** Please enter your **Mistral API Key** in the left sidebar under **Update / Add Key** (or in Streamlit Secrets as `MISTRAL_API_KEY`) to extract invoices.")
 
 # Store extracted results across sessions
 if "extractions" not in st.session_state:

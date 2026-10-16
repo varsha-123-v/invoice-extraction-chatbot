@@ -183,10 +183,22 @@ def extract_raw_text_from_file(file_path: Path) -> str:
     ext = file_path.suffix.lower()
     extracted_text = ""
 
-    if ext == ".pdf":
+    # Check if actual binary PDF
+    is_pdf_binary = False
+    try:
+        with open(file_path, "rb") as f:
+            header_bytes = f.read(5)
+        is_pdf_binary = header_bytes.startswith(b"%PDF")
+    except Exception:
+        pass
+
+    if ext == ".pdf" and is_pdf_binary:
         try:
             import pypdf
-            reader = pypdf.PdfReader(str(file_path))
+            raw_bytes = file_path.read_bytes()
+            if b"%%EOF" not in raw_bytes[-1024:]:
+                raw_bytes = raw_bytes + b"\n%%EOF\n"
+            reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
             pages_text = []
             for idx, page in enumerate(reader.pages, start=1):
                 txt = page.extract_text()
@@ -196,31 +208,64 @@ def extract_raw_text_from_file(file_path: Path) -> str:
         except Exception as e:
             logger.warning(f"pypdf extraction error: {e}")
 
-    if not extracted_text.strip() and ext != ".pdf":
+    # Fallback to plain text reading if not a binary PDF or text was empty
+    if not extracted_text.strip():
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 extracted_text = f.read()
         except Exception as e:
             logger.error(f"Failed to read file as text: {e}")
-    elif not extracted_text.strip() and ext == ".pdf":
-        # Check if the PDF file is actually plain text disguised with a .pdf extension
-        try:
-            with open(file_path, "rb") as f:
-                header_bytes = f.read(5)
-            if header_bytes != b"%PDF-":
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    extracted_text = f.read()
-        except Exception:
-            pass
 
     return extracted_text.strip()
 
 
 def render_pdf_to_base64_images(file_path: Path, max_pages: int = 50) -> List[str]:
-    """Renders PDF pages to compressed Base64 JPEG images (scale=1.5, max 1200px) optimized for fast Vision AI processing."""
+    """Renders PDF pages or image files to compressed Base64 JPEG images (scale=1.5, max 1200px) optimized for fast Vision AI processing."""
     base64_images = []
+
+    # 1. Direct Image Files (PNG, JPG, TIFF, WEBP)
+    ext = file_path.suffix.lower()
+    if ext in [".png", ".jpg", ".jpeg", ".tiff", ".webp"]:
+        try:
+            from PIL import Image
+            with Image.open(file_path) as pil_img:
+                pil_img = pil_img.convert("RGB")
+                pil_img.thumbnail((1200, 1200))
+                buffer = io.BytesIO()
+                pil_img.save(buffer, format="JPEG", quality=75, optimize=True)
+                b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                return [b64_str]
+        except Exception as e:
+            logger.warning(f"PIL failed to open image file '{file_path.name}': {e}")
+            return []
+
+    # 2. Check header magic bytes for PDF
     try:
-        pdf = pdfium.PdfDocument(str(file_path))
+        with open(file_path, "rb") as f:
+            header_bytes = f.read(5)
+        if not header_bytes.startswith(b"%PDF"):
+            # Check if it's an image disguised with a .pdf extension
+            try:
+                from PIL import Image
+                with Image.open(file_path) as pil_img:
+                    pil_img = pil_img.convert("RGB")
+                    pil_img.thumbnail((1200, 1200))
+                    buffer = io.BytesIO()
+                    pil_img.save(buffer, format="JPEG", quality=75, optimize=True)
+                    b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    return [b64_str]
+            except Exception:
+                return []
+    except Exception:
+        pass
+
+    # 3. Standard PDF rendering via pdfium with auto-repair for truncated EOF
+    try:
+        file_bytes = file_path.read_bytes()
+        if b"%%EOF" not in file_bytes[-1024:]:
+            file_bytes = file_bytes + b"\n%%EOF\n"
+
+        pdf = pdfium.PdfDocument(file_bytes)
         num_pages = min(len(pdf), max_pages)
         logger.info(f"Rendering {num_pages} pages (scale=1.5, 1200px) from PDF '{file_path.name}' for Vision AI...")
         for i in range(num_pages):
