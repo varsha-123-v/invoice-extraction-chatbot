@@ -385,7 +385,17 @@ def execute_ai_vision_call(
     Automatically switches to another configured, compatible provider when a rate limit,
     quota error, timeout, or temporary failure occurs.
     """
-    text_context = f"\n\n--- EXTRACTED DIGITAL PDF TEXT STREAM (EXACT DIGITAL CHARACTERS FROM PDF FILE) ---\n{doc_text}\n--- END DIGITAL PDF TEXT STREAM ---" if doc_text and doc_text.strip() else ""
+    # Bound text context to prevent exceeding model context window limits (e.g. 2.5MB raw OCR text dumps)
+    bounded_text = ""
+    if doc_text and doc_text.strip():
+        max_chars = 15000 if b64_images else 35000
+        clean_text = doc_text.strip()
+        if len(clean_text) > max_chars:
+            bounded_text = clean_text[:max_chars] + f"\n... [Truncated {len(clean_text) - max_chars} characters of raw text dump for context safety] ..."
+        else:
+            bounded_text = clean_text
+
+    text_context = f"\n\n--- EXTRACTED DIGITAL PDF TEXT STREAM (EXACT DIGITAL CHARACTERS FROM PDF FILE) ---\n{bounded_text}\n--- END DIGITAL PDF TEXT STREAM ---" if bounded_text else ""
 
     providers_to_try = key_manager.get_fallback_order()
     if not providers_to_try:
@@ -497,7 +507,16 @@ def execute_ai_vision_call(
 
                 except urllib.error.HTTPError as http_err:
                     last_error = http_err
+                    err_body = ""
+                    try:
+                        err_body = http_err.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
                     err_msg = f"{display_name} HTTP {http_err.code}: {http_err.reason}"
+                    if err_body:
+                        err_msg += f" - {err_body[:300]}"
+                    logger.warning(f"API Error from {display_name}: {err_msg}")
+
                     if http_err.code in (401, 402, 429):
                         # Auth failure, quota exhausted, or rate limit: mark and failover immediately
                         key_manager.mark_provider_error(provider_name, err_msg, status_code=http_err.code)
@@ -513,7 +532,9 @@ def execute_ai_vision_call(
                             key_manager.mark_provider_error(provider_name, err_msg, status_code=http_err.code)
                             break
                     else:
-                        key_manager.mark_provider_error(provider_name, err_msg, status_code=http_err.code)
+                        logger.warning(f"Request error from {display_name} on attempt {attempt}: {err_msg}")
+                        if attempt < max_attempts:
+                            continue
                         break
 
                 except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as net_err:
